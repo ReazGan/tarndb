@@ -208,6 +208,7 @@ int os_random(void *buf, size_t n) {
 #else
 
 #include <dirent.h>
+#include <stdio.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/file.h>
