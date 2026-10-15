@@ -410,6 +410,112 @@ static void test_compact_leftovers(void) {
     CHECK(!exists(in(d, "compact.tmp")));
 }
 
+/* The same crash, but the delete of the old files failed while the store
+ * stayed open (on Windows another process holding a file is enough), and a
+ * second compaction ran before the next open. */
+static void test_leftover_in_session(void) {
+    const char *d = fresh("leftover-session");
+    tarn_options o = fast(4096);
+    struct snapshot snap;
+    tarn *db = NULL;
+    tarn_stats st;
+
+    CHECK_RC(tarn_open(d, &o, &db), TARN_OK);
+    if (!db) return;
+    CHECK_RC(tarn_put(db, "gone", 4, "old-secret", 10), TARN_OK);
+    put_range(db, 0, 200, 0, 500);
+    tarn_close(db);
+
+    memset(&snap, 0, sizeof snap);
+    snap.dir = d;
+    os_list(d, take, &snap);
+
+    CHECK_RC(tarn_open(d, &o, &db), TARN_OK);
+    if (!db) return;
+    CHECK_RC(tarn_compact(db), TARN_OK);
+    for (size_t i = 0; i < snap.n; i++) {
+        const char *p = in(d, snap.names[i]);
+        if (!exists(p)) spit(p, "wb", snap.data[i], snap.size[i]);
+        free(snap.data[i]);
+    }
+    CHECK_RC(tarn_delete(db, "gone", 4), TARN_OK);
+    put_range(db, 200, 300, 0, 500);
+    CHECK_RC(tarn_compact(db), TARN_OK);
+    tarn_close(db);
+
+    CHECK_RC(tarn_open(d, &o, &db), TARN_OK);
+    if (!db) return;
+    CHECK(absent(db, "gone"));
+    check_range(db, 0, 300, 0, 500);
+    tarn_get_stats(db, &st);
+    CHECK(st.segments == 2);
+    tarn_close(db);
+}
+
+static void le32(unsigned char *p, uint32_t v) {
+    for (int i = 0; i < 4; i++) p[i] = (unsigned char)(v >> (8 * i));
+}
+
+/* Writes the exact bytes tarn would write for key=val. */
+static size_t record_image(unsigned char *out, const char *key, const char *val) {
+    uint32_t kl = (uint32_t)strlen(key), vl = (uint32_t)strlen(val);
+    le32(out + 4, kl);
+    le32(out + 8, vl);
+    memcpy(out + REC_HDR, key, kl);
+    memcpy(out + REC_HDR + kl, val, vl);
+    le32(out + 12, crc32c(0, out + REC_HDR, kl + vl));
+    le32(out, crc32c(0, out + 4, 12));
+    return REC_HDR + kl + vl;
+}
+
+/* A value that carries a valid record image (a backup, a stored segment)
+ * is torn by a crash. The image must not be taken for a record, and the
+ * torn record must not swallow what is written after recovery. */
+static void test_torn_embedded(void) {
+    static unsigned char blob[8000];
+    const char *d = fresh("embedded");
+    tarn_options o = fast(0);
+    unsigned char *full;
+    size_t before, size, cut;
+    tarn *db = NULL;
+    tarn_stats st;
+
+    memset(blob, 'x', sizeof blob);
+    record_image(blob + 1000, "acct", "0");
+    CHECK_RC(tarn_open(d, &o, &db), TARN_OK);
+    if (!db) return;
+    CHECK_RC(tarn_put(db, "acct", 4, "1000000", 7), TARN_OK);
+    tarn_close(db);
+    free(slurp(in(d, "00000001.seg"), &before));
+
+    CHECK_RC(tarn_open(d, &o, &db), TARN_OK);
+    if (!db) return;
+    CHECK_RC(tarn_put(db, "blob", 4, blob, sizeof blob), TARN_OK);
+    tarn_close(db);
+    full = slurp(in(d, "00000001.seg"), &size);
+    cut = before + REC_HDR + 4 + 6000;
+    CHECK(full && size > cut);
+    if (!full || size <= cut) return;
+    spit(in(d, "00000001.seg"), "wb", full, cut);
+    free(full);
+
+    CHECK_RC(tarn_open(d, &o, &db), TARN_OK);
+    if (!db) return;
+    CHECK(has(db, "acct", "1000000", 7));
+    CHECK(absent(db, "blob"));
+    tarn_get_stats(db, &st);
+    CHECK(st.recovered_bytes == cut - before);
+    CHECK(st.corrupt_records == 0);
+    put_range(db, 0, 60, 0, 300);
+    tarn_close(db);
+
+    CHECK_RC(tarn_open(d, &o, &db), TARN_OK);
+    if (!db) return;
+    CHECK(has(db, "acct", "1000000", 7));
+    check_range(db, 0, 60, 0, 300);
+    tarn_close(db);
+}
+
 /* Cut the file at every byte of the last record, as a crash in the middle
  * of the write would. Everything before it must survive untouched and the
  * torn record must never be returned. */
@@ -625,7 +731,9 @@ int main(int argc, char **argv) {
     test_rollover();
     test_compact();
     test_compact_leftovers();
+    test_leftover_in_session();
     test_torn_tail();
+    test_torn_embedded();
     test_bitflip();
     test_rot_after_open();
     test_zero_tail();

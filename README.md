@@ -64,7 +64,9 @@ is checked. What the checker finds decides what happens:
 
 - A torn record at the very end of the newest segment is what a crash in
   the middle of a write looks like. It is cut off and appends continue
-  from there.
+  from there. Its unfinished bytes are never searched for records, so a
+  value that happens to contain a copy of a tarn record cannot be mistaken
+  for one.
 - A record with a sound header but a bad value is skipped. The header still
   says where the next record starts.
 - A damaged header hides where the next record starts. tarn slides forward
@@ -116,8 +118,11 @@ The test suite does more than round-trip some keys:
   checks that only that record is lost
 - SIGKILLs a writer at different points and checks that every put it saw
   acknowledged is there afterwards, byte for byte (Linux and macOS)
-- rebuilds the state a crash leaves halfway through compaction and checks
-  that nothing deleted comes back
+- rebuilds the state a crash leaves halfway through compaction, and the
+  state a delete blocked by another process leaves, and checks that nothing
+  deleted comes back
+- tears a write whose value carries a valid record image and checks that
+  the image is never taken for a record
 - runs the hash table through 200,000 random inserts and removes against a
   plain array
 - pins CRC32C and SipHash to published test vectors, and the SSE4.2/ARM
@@ -161,6 +166,9 @@ your writes with `TARN_SYNC_NONE` and `tarn_sync` if you need more.
 - Keys up to 64 KiB, values up to 1 GiB.
 - One handle per directory. A handle is not thread safe; put a mutex
   around it if threads share it.
+- When the disk damages a record header, recovery searches forward for the
+  next intact record. If the damaged record's value holds a byte-exact copy
+  of a tarn record, that copy can be read back as a record.
 - No range scans: keys are hashed, not sorted.
 
 ## License

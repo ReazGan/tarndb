@@ -29,6 +29,7 @@ endif()
 
 if(TARN_FUZZ)
   add_compile_options(-fsanitize=fuzzer-no-link,address,undefined -fno-omit-frame-pointer)
+  add_link_options(-fsanitize=address,undefined)
 endif()
 
 find_package(Threads REQUIRED)

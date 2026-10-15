@@ -43,7 +43,9 @@
 #define MIN_SEGMENT ((uint64_t)4 << 10)
 #define COMPACT_TMP "compact.tmp"
 
-enum { REC_GOOD, REC_BAD_HEADER, REC_BAD_BODY, REC_SHORT };
+/* REC_TORN: the header is sound but the record runs past the end of the file.
+   REC_SHORT: not even a whole header is left. */
+enum { REC_GOOD, REC_BAD_HEADER, REC_BAD_BODY, REC_TORN, REC_SHORT };
 
 struct seg {
     uint32_t id;
@@ -322,17 +324,17 @@ static int check_record(tarn *db, struct reader *r, uint64_t off, uint64_t end, 
         (vlen > TARN_MAX_VALUE && vlen != TOMBSTONE))
         return REC_BAD_HEADER;
     uint64_t total = (uint64_t)REC_HDR + klen + (vlen == TOMBSTONE ? 0 : vlen);
-    if (total > end - off) return REC_SHORT;
+    if (total > end - off) return REC_TORN;
     *len = (uint32_t)total;
 
     if (rd(r, off + REC_HDR, h + REC_HDR, klen, &got)) return -1;
-    if (got < klen) return REC_SHORT;
+    if (got < klen) return REC_TORN;
     uint32_t crc = crc32c(0, h + REC_HDR, klen);
     for (uint64_t p = off + REC_HDR + klen, stop = off + total; p < stop;) {
         const unsigned char *s;
         size_t n;
         if (rd_span(r, p, chunk(stop - p), &s, &n)) return -1;
-        if (n == 0) return REC_SHORT;
+        if (n == 0) return REC_TORN;
         crc = crc32c(crc, s, n);
         p += n;
     }
@@ -427,7 +429,15 @@ static int scan(tarn *db, struct seg *s, int last) {
             off += len;
             continue;
         }
-        /* bad header, or a record running past the end of the file */
+        if (r == REC_TORN) {
+            /* Everything from here to the end is this record's own unfinished
+               bytes. Searching them for records would pick up any record image
+               stored inside the value as if it were real. */
+            if (last) return cut_tail(db, s, off);
+            db->corrupt++;
+            break;
+        }
+        /* bad header, or a scrap shorter than a header */
         rc = resync(db, &rdr, off + 1, s->size, &next);
         if (rc) return rc;
         if (next == s->size && last) return cut_tail(db, s, off);
@@ -509,8 +519,10 @@ static int open_segments(tarn *db, const struct listing *l) {
 
 /*
  * A compaction that renamed its output into place but crashed before
- * deleting the segments it replaced leaves them behind. The base field of
- * the output names them; finish the job.
+ * deleting the segments it replaced leaves them behind, and so does a delete
+ * that failed because another process had the file open. The base field of
+ * the output names them; finish the job. If a delete fails here too, the
+ * next compaction's base still covers the file.
  */
 static int drop_replaced(tarn *db) {
     size_t keep = 0;
@@ -877,8 +889,8 @@ static int commit(tarn *db, const char *tmp, const char *dst, size_t nold, uint3
     if (os_rename(tmp, dst)) return reopen_closed(db, nold) ? poison(db) : TARN_IO;
 
     /* Committed: the file at hi now stands for every segment from lo to hi.
-       The old files go only once the rename is durable; if they outlive a
-       crash, the next open removes them. */
+       The old files go only once the rename is durable. Any that survive, a
+       crash or a failed delete, are removed by the next open. */
     int durable = os_sync_dir(db->dir) == 0;
     if (durable)
         for (size_t i = 0; i + 1 < nold; i++) drop_file(db, db->segs[i].id);
@@ -910,7 +922,9 @@ int tarn_compact(tarn *db) {
     if (rc || db->nsegs < 2) return rc;
 
     size_t nold = db->nsegs - 1, n = 0;
-    uint32_t lo = db->segs[0].id, hi = db->segs[nold - 1].id;
+    /* base, not id: a file the last compaction failed to delete is still on
+       disk, and the new output has to keep covering it */
+    uint32_t lo = db->segs[0].base, hi = db->segs[nold - 1].id;
     uint64_t size = 0;
     char *tmp = join(db->dir, COMPACT_TMP), *dst = seg_path(db, hi);
     struct islot **live = live_records(db, hi, &n);

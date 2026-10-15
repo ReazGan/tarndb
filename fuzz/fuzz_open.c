@@ -11,6 +11,14 @@
 
 static char dir[64], seg[96];
 
+static int remove_entry(const char *name, void *user) {
+    char p[160];
+    (void)user;
+    snprintf(p, sizeof p, "%s/%s", dir, name);
+    os_remove(p);
+    return 0;
+}
+
 static int read_back(const void *key, size_t klen, void *user) {
     void *v;
     size_t n;
@@ -35,6 +43,8 @@ int LLVMFuzzerTestOneInput(const unsigned char *data, size_t size) {
         snprintf(seg, sizeof seg, "%s/00000001.seg", dir);
         os_mkdir(dir);
     }
+    /* each input starts from an empty directory, so a crash reproduces alone */
+    os_list(dir, remove_entry, NULL);
     /* first byte picks whether the input gets a valid header in front */
     FILE *f = fopen(seg, "wb");
     if (!f) return 0;
